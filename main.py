@@ -7,16 +7,28 @@ import base64
 import binascii
 import hmac
 import io
+import multiprocessing
 import os
-from typing import List
+import threading
+from concurrent.futures import ProcessPoolExecutor
+from typing import List, Tuple
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field
+
+from xlsx_builder import XlsxBuildError, build_xlsx_from_json
 
 app = FastAPI()
 
 DRAW_TOKEN = os.getenv("DRAW_TOKEN", "")
+
+# Ограничение тела запроса /xlsx: 200 000 строк образца занимают около 12 МБ
+XLSX_MAX_BODY_BYTES = 50 * 1024 * 1024
+# Не больше двух сборок одновременно: каждая сборка — отдельный процесс с памятью
+XLSX_PARALLEL_BUILDS = threading.Semaphore(2)
+SPAWN_CONTEXT = multiprocessing.get_context("spawn")
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 # Цвет рамки по классу объекта
@@ -43,6 +55,11 @@ class DrawRequest(BaseModel):
 
 class DrawResponse(BaseModel):
     image: str
+
+
+class XlsxResponse(BaseModel):
+    file: str
+    rows: int
 
 
 def check_token(authorization: str) -> None:
@@ -116,3 +133,32 @@ async def draw(request: DrawRequest, authorization: str = Header("")):
     output = io.BytesIO()
     result_image.save(output, format="JPEG", quality=90)
     return DrawResponse(image=base64.b64encode(output.getvalue()).decode("ascii"))
+
+
+def build_xlsx_in_child_process(request_body: bytes) -> Tuple[bytes, int]:
+    """Разбирает запрос и собирает файл в отдельном процессе.
+
+    Основной процесс не разбирает JSON на десятки тысяч строк: он держит только байты тела.
+    Дочерний процесс завершается после сборки, и система забирает его память.
+    Railway берёт плату за занятую память, поэтому основной процесс остаётся лёгким.
+    """
+    with XLSX_PARALLEL_BUILDS:
+        with ProcessPoolExecutor(max_workers=1, mp_context=SPAWN_CONTEXT) as build_pool:
+            return build_pool.submit(build_xlsx_from_json, request_body).result()
+
+
+@app.post("/xlsx", response_model=XlsxResponse)
+async def xlsx(request: Request, authorization: str = Header("")):
+    check_token(authorization)
+
+    request_body = await request.body()
+    if len(request_body) > XLSX_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Request body is too large")
+
+    try:
+        # Сборка ждёт дочерний процесс в отдельном потоке и не блокирует другие запросы
+        file_bytes, rows_count = await run_in_threadpool(build_xlsx_in_child_process, request_body)
+    except XlsxBuildError as build_error:
+        raise HTTPException(status_code=build_error.status_code, detail=build_error.detail)
+
+    return XlsxResponse(file=base64.b64encode(file_bytes).decode("ascii"), rows=rows_count)
