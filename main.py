@@ -7,28 +7,17 @@ import base64
 import binascii
 import hmac
 import io
-import multiprocessing
+import math
 import os
-import threading
-from concurrent.futures import ProcessPoolExecutor
-from typing import List, Tuple
+from typing import List
 
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.concurrency import run_in_threadpool
-from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
+from fastapi import FastAPI, Header, HTTPException
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field
-
-from xlsx_builder import XlsxBuildError, build_xlsx_from_json
 
 app = FastAPI()
 
 DRAW_TOKEN = os.getenv("DRAW_TOKEN", "")
-
-# Ограничение тела запроса /xlsx: 200 000 строк образца занимают около 12 МБ
-XLSX_MAX_BODY_BYTES = 50 * 1024 * 1024
-# Не больше двух сборок одновременно: каждая сборка — отдельный процесс с памятью
-XLSX_PARALLEL_BUILDS = threading.Semaphore(2)
-SPAWN_CONTEXT = multiprocessing.get_context("spawn")
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 # Цвет рамки по классу объекта
@@ -38,6 +27,10 @@ CLASS_COLORS = {
     "dog": (30, 110, 240),     # собака — синий
 }
 DEFAULT_COLOR = (0, 180, 0)
+
+# Осветление: фото со средней яркостью ниже порога считается тёмным (шкала 0-255)
+DARK_THRESHOLD = 100
+TARGET_BRIGHTNESS = 130
 
 
 class Box(BaseModel):
@@ -51,15 +44,11 @@ class Box(BaseModel):
 class DrawRequest(BaseModel):
     image: str
     boxes: List[Box] = []
+    enhance: bool = False
 
 
 class DrawResponse(BaseModel):
     image: str
-
-
-class XlsxResponse(BaseModel):
-    file: str
-    rows: int
 
 
 def check_token(authorization: str) -> None:
@@ -83,6 +72,24 @@ def to_pixels(box_2d: List[float], width: int, height: int):
     left, right = sorted((xmin / 1000 * width, xmax / 1000 * width))
     top, bottom = sorted((ymin / 1000 * height, ymax / 1000 * height))
     return round(left), round(top), round(right), round(bottom)
+
+
+def enhance_dark(image: Image.Image) -> Image.Image:
+    """Осветляет тёмное фото: растягивает контраст и поднимает среднюю яркость.
+    Светлое фото возвращается без изменений."""
+    image = image.convert("RGB")
+    brightness = ImageStat.Stat(image.convert("L")).mean[0]
+    if brightness >= DARK_THRESHOLD:
+        return image
+
+    image = ImageOps.autocontrast(image, cutoff=1)
+    brightness = ImageStat.Stat(image.convert("L")).mean[0]
+    if 0 < brightness < TARGET_BRIGHTNESS:
+        # Гамма-коррекция переводит среднюю яркость к целевой
+        gamma = math.log(TARGET_BRIGHTNESS / 255) / math.log(brightness / 255)
+        lookup = [round(255 * (value / 255) ** gamma) for value in range(256)]
+        image = image.point(lookup * 3)
+    return image
 
 
 def draw_boxes(image: Image.Image, boxes: List[Box]) -> Image.Image:
@@ -129,36 +136,9 @@ async def draw(request: DrawRequest, authorization: str = Header("")):
     except (binascii.Error, UnidentifiedImageError, OSError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid image")
 
+    if request.enhance:
+        source_image = enhance_dark(source_image)
     result_image = draw_boxes(source_image, request.boxes)
     output = io.BytesIO()
     result_image.save(output, format="JPEG", quality=90)
     return DrawResponse(image=base64.b64encode(output.getvalue()).decode("ascii"))
-
-
-def build_xlsx_in_child_process(request_body: bytes) -> Tuple[bytes, int]:
-    """Разбирает запрос и собирает файл в отдельном процессе.
-
-    Основной процесс не разбирает JSON на десятки тысяч строк: он держит только байты тела.
-    Дочерний процесс завершается после сборки, и система забирает его память.
-    Railway берёт плату за занятую память, поэтому основной процесс остаётся лёгким.
-    """
-    with XLSX_PARALLEL_BUILDS:
-        with ProcessPoolExecutor(max_workers=1, mp_context=SPAWN_CONTEXT) as build_pool:
-            return build_pool.submit(build_xlsx_from_json, request_body).result()
-
-
-@app.post("/xlsx", response_model=XlsxResponse)
-async def xlsx(request: Request, authorization: str = Header("")):
-    check_token(authorization)
-
-    request_body = await request.body()
-    if len(request_body) > XLSX_MAX_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="Request body is too large")
-
-    try:
-        # Сборка ждёт дочерний процесс в отдельном потоке и не блокирует другие запросы
-        file_bytes, rows_count = await run_in_threadpool(build_xlsx_in_child_process, request_body)
-    except XlsxBuildError as build_error:
-        raise HTTPException(status_code=build_error.status_code, detail=build_error.detail)
-
-    return XlsxResponse(file=base64.b64encode(file_bytes).decode("ascii"), rows=rows_count)
