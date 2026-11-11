@@ -7,7 +7,6 @@ import base64
 import binascii
 import hmac
 import io
-import math
 import multiprocessing
 import os
 import threading
@@ -16,7 +15,7 @@ from typing import List, Tuple
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field
 
 from xlsx_builder import XlsxBuildError, build_xlsx_from_json
@@ -25,8 +24,9 @@ app = FastAPI()
 
 DRAW_TOKEN = os.getenv("DRAW_TOKEN", "")
 
-# Ограничение тела запроса /xlsx: 200 000 строк образца занимают около 12 МБ
-XLSX_MAX_BODY_BYTES = 50 * 1024 * 1024
+# Ограничение тела запроса /xlsx: 200 000 строк образца занимают около 12 МБ.
+# Запас нужен на длинные коды и на JSON с отступами.
+XLSX_MAX_BODY_BYTES = 100 * 1024 * 1024
 # Не больше двух сборок одновременно: каждая сборка — отдельный процесс с памятью
 XLSX_PARALLEL_BUILDS = threading.Semaphore(2)
 SPAWN_CONTEXT = multiprocessing.get_context("spawn")
@@ -40,10 +40,6 @@ CLASS_COLORS = {
 }
 DEFAULT_COLOR = (0, 180, 0)
 
-# Осветление: фото со средней яркостью ниже порога считается тёмным (шкала 0-255)
-DARK_THRESHOLD = 100
-TARGET_BRIGHTNESS = 130
-
 
 class Box(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -56,7 +52,6 @@ class Box(BaseModel):
 class DrawRequest(BaseModel):
     image: str
     boxes: List[Box] = []
-    enhance: bool = False
 
 
 class DrawResponse(BaseModel):
@@ -89,24 +84,6 @@ def to_pixels(box_2d: List[float], width: int, height: int):
     left, right = sorted((xmin / 1000 * width, xmax / 1000 * width))
     top, bottom = sorted((ymin / 1000 * height, ymax / 1000 * height))
     return round(left), round(top), round(right), round(bottom)
-
-
-def enhance_dark(image: Image.Image) -> Image.Image:
-    """Осветляет тёмное фото: растягивает контраст и поднимает среднюю яркость.
-    Светлое фото возвращается без изменений."""
-    image = image.convert("RGB")
-    brightness = ImageStat.Stat(image.convert("L")).mean[0]
-    if brightness >= DARK_THRESHOLD:
-        return image
-
-    image = ImageOps.autocontrast(image, cutoff=1)
-    brightness = ImageStat.Stat(image.convert("L")).mean[0]
-    if 0 < brightness < TARGET_BRIGHTNESS:
-        # Гамма-коррекция переводит среднюю яркость к целевой
-        gamma = math.log(TARGET_BRIGHTNESS / 255) / math.log(brightness / 255)
-        lookup = [round(255 * (value / 255) ** gamma) for value in range(256)]
-        image = image.point(lookup * 3)
-    return image
 
 
 def draw_boxes(image: Image.Image, boxes: List[Box]) -> Image.Image:
@@ -153,8 +130,6 @@ async def draw(request: DrawRequest, authorization: str = Header("")):
     except (binascii.Error, UnidentifiedImageError, OSError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid image")
 
-    if request.enhance:
-        source_image = enhance_dark(source_image)
     result_image = draw_boxes(source_image, request.boxes)
     output = io.BytesIO()
     result_image.save(output, format="JPEG", quality=90)
