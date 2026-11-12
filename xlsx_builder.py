@@ -47,6 +47,8 @@ def to_number(text_value: str):
     """Превращает строку в число. Пустая строка даёт пустую ячейку."""
     if text_value == "":
         return None
+    # «Элемент» может разделять разряды пробелом: «1 500»
+    text_value = text_value.replace(" ", "").replace("\u00a0", "").replace("\u202f", "")
     try:
         return int(text_value)
     except ValueError:
