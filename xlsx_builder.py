@@ -5,6 +5,7 @@
 openpyxl импортируется внутри функции: основной процесс сервиса его не загружает.
 """
 import io
+import re
 from typing import List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field, ValidationError
@@ -86,6 +87,24 @@ def build_xlsx_from_json(request_body: bytes) -> Tuple[bytes, int]:
     return build_xlsx(xlsx_request), len(xlsx_request.rows)
 
 
+# Управляющий символ, недопустимый в XML файла xlsx: например GS (0x1D) в коде с криптохвостом
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# Текст, который Excel принял бы за запись символа: _x001D_
+_ESCAPE_LIKE_RE = re.compile(r"_(x[0-9A-Fa-f]{4}_)")
+
+
+def escape_control_chars(text_value):
+    """Записывает управляющие символы так, как их хранит Excel: GS (0x1D) -> _x001D_.
+
+    Excel при открытии превращает _x001D_ обратно в символ. Текст, похожий на такую запись,
+    защищается префиксом _x005F_, иначе Excel исказил бы его.
+    """
+    if not isinstance(text_value, str) or "_" not in text_value and not _CONTROL_CHAR_RE.search(text_value):
+        return text_value
+    protected_value = _ESCAPE_LIKE_RE.sub(r"_x005F_\1", text_value)
+    return _CONTROL_CHAR_RE.sub(lambda match: "_x%04X_" % ord(match.group(0)), protected_value)
+
+
 def build_xlsx(xlsx_request: XlsxRequest) -> bytes:
     """Собирает файл xlsx из колонок, строк и уровня каждой строки.
 
@@ -133,7 +152,7 @@ def build_xlsx(xlsx_request: XlsxRequest) -> bytes:
                 row_cells.append(to_number(cell_value))
                 continue
             try:
-                text_cell = WriteOnlyCell(sheet, value=cell_value)
+                text_cell = WriteOnlyCell(sheet, value=escape_control_chars(cell_value))
             except IllegalCharacterError:
                 raise XlsxBuildError(400, f"Row {row_number - 1}: illegal character in value")
             # Формат «Текст»: Excel не превратит код с нулями в число
