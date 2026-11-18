@@ -14,11 +14,14 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import List, Tuple
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse
 from fastapi.concurrency import run_in_threadpool
 from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field
 
 from xlsx_builder import XlsxBuildError, build_xlsx_from_json
+import xlsx_merge
+from xlsx_merge import MergeError
 
 app = FastAPI()
 
@@ -163,3 +166,86 @@ async def xlsx(request: Request, authorization: str = Header("")):
         raise HTTPException(status_code=build_error.status_code, detail=build_error.detail)
 
     return XlsxResponse(file=base64.b64encode(file_bytes).decode("ascii"), rows=rows_count)
+
+
+# ---------- Склейка файлов частей ----------
+
+
+class MergeCreateRequest(BaseModel):
+    file_name: str = "result.xlsx"
+
+
+class MergeCreateResponse(BaseModel):
+    id: str
+
+
+class MergePartRequest(BaseModel):
+    number: int
+    file: str
+
+
+class MergeFinishRequest(BaseModel):
+    parts: int
+    max_level: int = 0
+
+
+class MergeFinishResponse(BaseModel):
+    path: str
+    rows: int
+
+
+def merge_error(error: MergeError) -> HTTPException:
+    return HTTPException(status_code=error.status_code, detail=error.detail)
+
+
+def merge_in_child_process(merge_id: str, expected_parts: int, max_level: int) -> int:
+    """Склейка идёт в отдельном процессе, как сборка /xlsx: память основного процесса не растёт."""
+    with XLSX_PARALLEL_BUILDS:
+        with ProcessPoolExecutor(max_workers=1, mp_context=SPAWN_CONTEXT) as merge_pool:
+            return merge_pool.submit(xlsx_merge.merge_parts, merge_id, expected_parts, max_level).result()
+
+
+@app.post("/xlsx/merge", response_model=MergeCreateResponse)
+async def merge_create(request: MergeCreateRequest, authorization: str = Header("")):
+    check_token(authorization)
+    return MergeCreateResponse(id=xlsx_merge.create_merge(request.file_name))
+
+
+@app.post("/xlsx/merge/{merge_id}/part")
+async def merge_part(merge_id: str, request: MergePartRequest, authorization: str = Header("")):
+    check_token(authorization)
+    try:
+        part_bytes = base64.b64decode(request.file, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="Part file is not valid Base64")
+    try:
+        xlsx_merge.save_part(merge_id, request.number, part_bytes)
+    except MergeError as error:
+        raise merge_error(error)
+    return {"number": request.number}
+
+
+@app.post("/xlsx/merge/{merge_id}/finish", response_model=MergeFinishResponse)
+async def merge_finish(merge_id: str, request: MergeFinishRequest, authorization: str = Header("")):
+    check_token(authorization)
+    try:
+        xlsx_merge.read_meta(merge_id)
+        rows_count = await run_in_threadpool(merge_in_child_process, merge_id, request.parts, request.max_level)
+    except MergeError as error:
+        raise merge_error(error)
+    return MergeFinishResponse(path=f"/xlsx/merge/{merge_id}/file", rows=rows_count)
+
+
+@app.get("/xlsx/merge/{merge_id}/file")
+async def merge_file(merge_id: str):
+    """Скачивание общего файла без токена: доступ даёт случайный номер сборки из 32 знаков."""
+    try:
+        meta = xlsx_merge.read_meta(merge_id)
+        file_path = xlsx_merge.result_path(merge_id)
+    except MergeError as error:
+        raise merge_error(error)
+    return FileResponse(
+        file_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=meta["file_name"],
+    )
